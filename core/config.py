@@ -64,6 +64,7 @@ class Settings:
 
     app_title: str
     app_version: str
+    log_level: str
 
 
 def load_settings() -> Settings:
@@ -125,6 +126,10 @@ def load_settings() -> Settings:
             "APP_VERSION",
             "0.1.0",
         ).strip(),
+        log_level=os.getenv(
+            "LOG_LEVEL",
+            "INFO",
+        ).strip().upper(),
     )
 
 

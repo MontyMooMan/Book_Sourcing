@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import uuid
@@ -23,7 +24,11 @@ from sqlalchemy import (
 )
 
 from core.database import engine
+from core.logging_config import configure_logging
 from core.models import Offer
+
+configure_logging()
+logger = logging.getLogger("booksourcing.jobs")
 
 
 _JOB_METADATA = MetaData()
@@ -392,8 +397,107 @@ class SearchJobStore:
         ]
 
 
+    def requeue_running_jobs(
+        self,
+    ) -> int:
+        with engine.begin() as connection:
+            result = connection.execute(
+                update(_SEARCH_JOBS)
+                .where(
+                    _SEARCH_JOBS.c.status
+                    == "running"
+                )
+                .values(
+                    status="queued",
+                    completed_checks=0,
+                    message="Recovered after worker restart",
+                    error="",
+                    started_at=None,
+                    finished_at=None,
+                )
+            )
+
+        count = result.rowcount or 0
+
+        if count:
+            logger.warning(
+                "Recovered %s interrupted search job(s).",
+                count,
+            )
+
+        return count
+
+    def claim_next_job(
+        self,
+    ) -> SearchJob | None:
+        with engine.begin() as connection:
+            row = connection.execute(
+                select(_SEARCH_JOBS)
+                .where(
+                    _SEARCH_JOBS.c.status
+                    == "queued"
+                )
+                .order_by(
+                    _SEARCH_JOBS.c.created_at
+                )
+                .with_for_update(
+                    skip_locked=True
+                )
+                .limit(1)
+            ).mappings().first()
+
+            if row is None:
+                return None
+
+            started_at = _now_iso()
+
+            connection.execute(
+                update(_SEARCH_JOBS)
+                .where(
+                    _SEARCH_JOBS.c.id
+                    == row["id"]
+                )
+                .values(
+                    status="running",
+                    completed_checks=0,
+                    message="Search starting",
+                    error="",
+                    started_at=started_at,
+                    finished_at=None,
+                )
+            )
+
+        payload = _json_restore(
+            json.loads(
+                row["payload_json"]
+            )
+        )
+
+        return SearchJob(
+            id=row["id"],
+            payload=payload,
+            status="running",
+            completed_checks=0,
+            total_checks=(
+                row["total_checks"]
+                or 0
+            ),
+            message="Search starting",
+            result=None,
+            error="",
+            created_at=row["created_at"],
+            started_at=started_at,
+            finished_at=None,
+        )
+
+
 class SearchQueue:
-    """Single FIFO queue with PostgreSQL-backed job persistence."""
+    """
+    PostgreSQL-backed FIFO queue.
+
+    The web process submits and reads jobs only.
+    A separate worker process claims and executes queued jobs.
+    """
 
     def __init__(
         self,
@@ -401,27 +505,18 @@ class SearchQueue:
             [SearchJob],
             Any,
         ],
+        *,
+        worker_mode: bool = False,
+        poll_seconds: float = 1.0,
     ):
         self.handler = handler
-        self._jobs: dict[
-            str,
-            SearchJob,
-        ] = {}
-        self._jobs_lock = threading.Lock()
-        self._queue: queue.Queue[
-            SearchJob
-        ] = queue.Queue()
-
+        self.worker_mode = worker_mode
+        self.poll_seconds = poll_seconds
         self._store = SearchJobStore()
+        self._stop_requested = threading.Event()
 
-        self._recover_unfinished_jobs()
-
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="SearchQueueWorker",
-            daemon=True,
-        )
-        self._worker.start()
+        if self.worker_mode:
+            self._store.requeue_running_jobs()
 
     def _attach_persistence(
         self,
@@ -431,32 +526,6 @@ class SearchQueue:
             self._store.save
         )
         return job
-
-    def _recover_unfinished_jobs(
-        self,
-    ) -> None:
-        recovered = (
-            self._store
-            .unfinished_jobs()
-        )
-
-        for job in recovered:
-            self._attach_persistence(
-                job
-            )
-
-            with self._jobs_lock:
-                self._jobs[job.id] = job
-
-            job.persist()
-            self._queue.put(job)
-
-        if recovered:
-            print(
-                "Recovered "
-                f"{len(recovered)} "
-                "unfinished search job(s)."
-            )
 
     def submit(
         self,
@@ -468,12 +537,7 @@ class SearchQueue:
         )
 
         self._attach_persistence(job)
-
-        with self._jobs_lock:
-            self._jobs[job.id] = job
-
         job.persist()
-        self._queue.put(job)
 
         return job
 
@@ -481,14 +545,6 @@ class SearchQueue:
         self,
         job_id: str,
     ) -> SearchJob | None:
-        with self._jobs_lock:
-            job = self._jobs.get(
-                job_id
-            )
-
-        if job is not None:
-            return job
-
         job = self._store.get(
             job_id
         )
@@ -496,12 +552,9 @@ class SearchQueue:
         if job is None:
             return None
 
-        self._attach_persistence(job)
-
-        with self._jobs_lock:
-            self._jobs[job.id] = job
-
-        return job
+        return self._attach_persistence(
+            job
+        )
 
     def queue_position(
         self,
@@ -532,18 +585,35 @@ class SearchQueue:
         except ValueError:
             return None
 
-    def _worker_loop(self) -> None:
-        while True:
-            job = self._queue.get()
+    def run_worker_forever(
+        self,
+    ) -> None:
+        if not self.worker_mode:
+            raise RuntimeError(
+                "SearchQueue is not in worker mode."
+            )
+
+        logger.info(
+            "Search worker started; waiting for queued jobs."
+        )
+
+        while not self._stop_requested.is_set():
+            job = self._store.claim_next_job()
+
+            if job is None:
+                self._stop_requested.wait(
+                    self.poll_seconds
+                )
+                continue
+
+            self._attach_persistence(job)
+
+            logger.info(
+                "Claimed search job %s",
+                job.id,
+            )
 
             try:
-                job.status = "running"
-                job.started_at = _now_iso()
-                job.finished_at = None
-                job.error = ""
-                job.message = "Search starting"
-                job.persist()
-
                 job.result = self.handler(job)
 
                 job.status = "complete"
@@ -559,15 +629,26 @@ class SearchQueue:
                 job.error = str(exc)
                 job.message = "Search failed"
 
-                print(
-                    f"Search job {job.id} "
-                    f"failed: {exc}"
+                logger.exception(
+                    "Search job %s failed: %s",
+                    job.id,
+                    exc,
                 )
 
             finally:
                 job.finished_at = _now_iso()
+                job.persist()
 
-                try:
-                    job.persist()
-                finally:
-                    self._queue.task_done()
+                logger.info(
+                    "Finished search job %s with status %s",
+                    job.id,
+                    job.status,
+                )
+
+        logger.info("Search worker stopped.")
+
+    def stop_worker(
+        self,
+    ) -> None:
+        self._stop_requested.set()
+

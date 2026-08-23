@@ -1,0 +1,10 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+jinja2>=3.1,<4
+python-multipart>=0.0.20,<1
+requests>=2.32,<3
+beautifulsoup4>=4.13,<5
+playwright>=1.55,<2
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+python-dotenv>=1.0,<2

@@ -1,5 +1,7 @@
 from pathlib import Path
+import logging
 import re
+import time
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -11,6 +13,7 @@ from bibliography.service import BibliographyService
 
 from core.comparison import cheapest_offer, comparison_price_myr
 from core.config import settings
+from core.logging_config import configure_logging
 from core.isbn import validate_isbn
 from core.search_jobs import SearchJob, SearchQueue
 from core.sourcing import SourcingEngine
@@ -24,11 +27,48 @@ from suppliers.amazon_uk import AmazonUKSupplier
 from suppliers.amazon_us import AmazonUSSupplier
 
 
+configure_logging()
+logger = logging.getLogger("booksourcing.web")
+
 app = FastAPI(
     title=settings.app_title,
     version=settings.app_version,
     debug=settings.debug,
 )
+
+
+@app.middleware("http")
+async def log_requests(
+    request: Request,
+    call_next,
+):
+    started = time.perf_counter()
+
+    try:
+        response = await call_next(
+            request
+        )
+    except Exception:
+        logger.exception(
+            "Unhandled request error | %s %s",
+            request.method,
+            request.url.path,
+        )
+        raise
+
+    duration_ms = (
+        time.perf_counter() - started
+    ) * 1000
+
+    logger.info(
+        "%s %s -> %s (%.0f ms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+
+    return response
 
 BASE_DIR = Path(__file__).resolve().parent
 
