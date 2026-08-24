@@ -1,10 +1,13 @@
 from pathlib import Path
+import base64
 import logging
+import os
 import re
+import secrets
 import time
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from bibliography.google_books import GoogleBooksProvider
@@ -35,6 +38,71 @@ app = FastAPI(
     version=settings.app_version,
     debug=settings.debug,
 )
+
+
+STAGING_USERNAME = os.getenv("STAGING_USERNAME", "")
+STAGING_PASSWORD = os.getenv("STAGING_PASSWORD", "")
+
+
+@app.middleware("http")
+async def require_staging_auth(
+    request: Request,
+    call_next,
+):
+    # Keep the health endpoint available to Render's health checker.
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    # Local development remains unchanged.
+    if settings.environment != "staging":
+        return await call_next(request)
+
+    # Fail closed in staging if credentials have not been configured.
+    if not STAGING_USERNAME or not STAGING_PASSWORD:
+        logger.error(
+            "Staging authentication is enabled by APP_ENV=staging "
+            "but STAGING_USERNAME/STAGING_PASSWORD are missing."
+        )
+        return PlainTextResponse(
+            "Staging authentication is not configured.",
+            status_code=503,
+        )
+
+    authorization = request.headers.get("Authorization", "")
+
+    if authorization.startswith("Basic "):
+        try:
+            encoded = authorization.split(" ", 1)[1]
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            username, password = decoded.split(":", 1)
+
+            username_ok = secrets.compare_digest(
+                username,
+                STAGING_USERNAME,
+            )
+            password_ok = secrets.compare_digest(
+                password,
+                STAGING_PASSWORD,
+            )
+
+            if username_ok and password_ok:
+                return await call_next(request)
+        except (ValueError, UnicodeDecodeError):
+            pass
+        except Exception:
+            logger.warning(
+                "Invalid staging authentication header.",
+                exc_info=True,
+            )
+
+    return PlainTextResponse(
+        "Authentication required.",
+        status_code=401,
+        headers={
+            "WWW-Authenticate": 'Basic realm="Book Sourcing Staging"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.middleware("http")
